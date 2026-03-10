@@ -5,7 +5,7 @@
 FROM docker.io/library/python:3.14-alpine3.23 AS build-venv
 
 RUN apk update && \
-    apk add gcc g++ linux-headers
+    apk add gcc g++ linux-headers git
 
 COPY ./src/product-reviews/requirements.txt requirements.txt
 

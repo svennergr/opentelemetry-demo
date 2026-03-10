@@ -1,0 +1,46 @@
+logging {
+  level = "info"
+}
+
+otelcol.receiver.otlp "default" {
+  grpc {
+    endpoint = "0.0.0.0:4317"
+  }
+
+  http {
+    endpoint = "0.0.0.0:4318"
+  }
+
+  output {
+    traces  = [otelcol.processor.batch.default.input]
+    metrics = [otelcol.processor.batch.default.input]
+  }
+}
+
+otelcol.processor.batch "default" {
+  output {
+    traces  = [otelcol.exporter.otlp.tempo.input]
+    metrics = [otelcol.exporter.otlphttp.prometheus.input]
+  }
+}
+
+otelcol.exporter.otlp "tempo" {
+  client {
+    endpoint = "sigil-tempo:4317"
+    headers  = {
+      "X-Scope-OrgID" = "fake",
+    }
+    tls {
+      insecure = true
+    }
+  }
+}
+
+otelcol.exporter.otlphttp "prometheus" {
+  client {
+    endpoint = "http://sigil-prometheus:9090/api/v1/otlp"
+    tls {
+      insecure = true
+    }
+  }
+}

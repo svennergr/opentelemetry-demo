@@ -547,6 +547,9 @@ services:
       - FLAGD_PORT
       - LLM_HOST
       - LLM_PORT
+      - SIGIL_EXPORT_PROTOCOL
+      - SIGIL_EXPORT_ENDPOINT
+      - SIGIL_TENANT_ID
     depends_on:
       product-catalog:
         condition: service_started

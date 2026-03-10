@@ -5,11 +5,13 @@
 
 
 # Python
-import os
+import atexit
 import json
-from concurrent import futures
+import os
 import random
+import uuid
 from typing import Any
+from concurrent import futures
 
 # Pip
 import grpc
@@ -46,7 +48,20 @@ from openai import AsyncOpenAI
 from agents import Agent, Runner, RunConfig, function_tool, set_tracing_disabled
 from agents.models.openai_chatcompletions import OpenAIChatCompletionsModel
 
+from sigil_sdk import (
+    Client as SigilClient,
+    ClientConfig,
+    GenerationExportConfig,
+    AuthConfig,
+    GenerationStart,
+    ModelRef,
+    user_text_message,
+    assistant_text_message,
+)
+
 from google.protobuf.json_format import MessageToJson
+
+SIGIL_AGENT_NAME = "product-reviews-assistant"
 
 llm_host = None
 llm_port = None
@@ -56,6 +71,7 @@ llm_api_key = None
 llm_model = None
 product_agent = None
 product_catalog_stub = None
+sigil_client = None
 
 SYSTEM_PROMPT = (
     "You are a helpful assistant that answers related to a specific product. "
@@ -157,7 +173,7 @@ def get_average_product_review_score(request_product_id):
 
         return product_review_score
 
-def maybe_return_rate_limit_error(question: str, request_product_id: str, span):
+def maybe_return_rate_limit_error(question: str, request_product_id: str, conversation_id: str, span):
     llm_rate_limit_error = check_feature_flag("llmRateLimitError")
     logger.info(f"llmRateLimitError feature flag: {llm_rate_limit_error}")
     if not llm_rate_limit_error:
@@ -179,16 +195,22 @@ def maybe_return_rate_limit_error(question: str, request_product_id: str, span):
     ]
 
     logger.info("Invoking mock LLM with model: astronomy-llm-rate-limit")
-    try:
-        client.chat.completions.create(
-            model="astronomy-llm-rate-limit",
-            messages=messages,
-        )
-    except Exception as e:
-        logger.error(f"Caught Exception: {e}")
-        span.record_exception(e)
-        span.set_status(Status(StatusCode.ERROR, description=str(e)))
-        return "The system is unable to process your response. Please try again later."
+    with sigil_client.start_generation(GenerationStart(
+        conversation_id=conversation_id,
+        agent_name=SIGIL_AGENT_NAME,
+        model=ModelRef(provider="openai", name="astronomy-llm-rate-limit"),
+    )) as gen_rec:
+        try:
+            client.chat.completions.create(
+                model="astronomy-llm-rate-limit",
+                messages=messages,
+            )
+        except Exception as e:
+            gen_rec.set_call_error(e)
+            logger.error(f"Caught Exception: {e}")
+            span.record_exception(e)
+            span.set_status(Status(StatusCode.ERROR, description=str(e)))
+            return "The system is unable to process your response. Please try again later."
 
     return None
 
@@ -198,11 +220,13 @@ def get_ai_assistant_response(request_product_id, question, history: list[dict[s
     with tracer.start_as_current_span("get_ai_assistant_response") as span:
 
         ai_assistant_response = demo_pb2.AskProductAIAssistantResponse()
+        conversation_id = f"product-review-{uuid.uuid4()}"
 
         span.set_attribute("app.product.id", request_product_id)
         span.set_attribute("app.product.question", question)
+        span.set_attribute("gen_ai.conversation.id", conversation_id)
 
-        rate_limit_message = maybe_return_rate_limit_error(question, request_product_id, span)
+        rate_limit_message = maybe_return_rate_limit_error(question, request_product_id, conversation_id, span)
         if rate_limit_message is not None:
             ai_assistant_response.response = rate_limit_message
             return ai_assistant_response
@@ -227,20 +251,31 @@ def get_ai_assistant_response(request_product_id, question, history: list[dict[s
         input_items = sanitized_history + [{"role": "user", "content": user_prompt}]
         logger.info(f"Invoking product agent with input: '{input_items}'")
 
-        try:
-            result = Runner.run_sync(
-                product_agent,
-                input_items,
-                max_turns=10,
-                run_config=RunConfig(),
-            )
-            ai_assistant_response.response = str(result.final_output)
-            logger.info(f"Returning an AI assistant response: '{ai_assistant_response.response}'")
-        except Exception as e:
-            logger.error(f"Caught Exception during agent run: {e}")
-            span.record_exception(e)
-            span.set_status(Status(StatusCode.ERROR, description=str(e)))
-            ai_assistant_response.response = "The system is unable to process your response. Please try again later."
+        with sigil_client.start_generation(GenerationStart(
+            conversation_id=conversation_id,
+            agent_name=SIGIL_AGENT_NAME,
+            model=ModelRef(provider="openai", name=llm_model),
+        )) as gen_rec:
+            try:
+                result = Runner.run_sync(
+                    product_agent,
+                    input_items,
+                    max_turns=10,
+                    run_config=RunConfig(),
+                )
+                response_text = str(result.final_output)
+                gen_rec.set_result(
+                    input=[user_text_message(user_prompt)],
+                    output=[assistant_text_message(response_text)],
+                )
+                ai_assistant_response.response = response_text
+                logger.info(f"Returning an AI assistant response: '{response_text}'")
+            except Exception as e:
+                gen_rec.set_call_error(e)
+                logger.error(f"Caught Exception during agent run: {e}")
+                span.record_exception(e)
+                span.set_status(Status(StatusCode.ERROR, description=str(e)))
+                ai_assistant_response.response = "The system is unable to process your response. Please try again later."
 
         # Collect metrics for this service
         product_review_svc_metrics["app_ai_assistant_counter"].add(1, {'product.id': request_product_id})
@@ -302,6 +337,19 @@ if __name__ == "__main__":
     llm_base_url = must_map_env('LLM_BASE_URL')
     llm_api_key = must_map_env('OPENAI_API_KEY')
     llm_model = must_map_env('LLM_MODEL')
+
+    sigil_export_protocol = os.environ.get('SIGIL_EXPORT_PROTOCOL', 'none')
+    sigil_export_endpoint = os.environ.get('SIGIL_EXPORT_ENDPOINT', '')
+    sigil_tenant_id = os.environ.get('SIGIL_TENANT_ID', '')
+    sigil_auth = AuthConfig(mode='tenant', tenant_id=sigil_tenant_id) if sigil_tenant_id else AuthConfig(mode='none')
+    sigil_client = SigilClient(ClientConfig(
+        generation_export=GenerationExportConfig(
+            protocol=sigil_export_protocol,
+            endpoint=sigil_export_endpoint,
+            auth=sigil_auth,
+        ),
+    ))
+    atexit.register(sigil_client.shutdown)
 
     catalog_addr = must_map_env('PRODUCT_CATALOG_ADDR')
     pc_channel = grpc.insecure_channel(catalog_addr)
